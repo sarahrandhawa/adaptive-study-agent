@@ -1,0 +1,43 @@
+Session 3 — prove the loop (no API keys)
+Stack: ADK
+This is an agent because the model chooses to call search_docs, observes live Pinecone chunks, then writes an answer from that result — the next step is not a fixed script.
+
+=== USER ===
+How many annual leave days do Northwind Robotics employees get, and which policy document ID says so?
+
+=== AGENT LOOP (Think / Act / Observe) ===
+  (model=gemini-3.5-flash-lite, max_llm_calls=6)
+  --- step 1 ---
+  ERROR    Gemini gemini-3.5-flash-lite: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}
+  hint: that model is busy or retired. Trying gemini-3.5-flash...
+  (model=gemini-3.5-flash, max_llm_calls=6)
+  --- step 1 ---
+  THINK    [northwind_faq_agent] propose tool call search_docs
+  ACT      [northwind_faq_agent] search_docs({'query': 'annual leave days vacation policy Northwind Robotics'})
+  --- step 2 ---
+  OBSERVE  [northwind_faq_agent] search_docs -> 
+status=ok query='annual leave days vacation policy Northwind Robotics' chunk_count=5
+  - POL-118:0 source=doc6_facilities.txt score=0.578737 text='Northwind Robotics Facilities and Workplace Guide Author: Workplace Experience Document ID: POL-118 Version: 1.2 Effective date: 1 March 2026 Classification: Internal - All Employe'
+  - POL-101:2 source=doc1_handbook.txt score=0.573934 text='Northwind Robotics designs, manufactures, and supports autonomous mobile robots for warehouse and light industrial environments. Our headquarters are in Cambridge, UK, with satelli'
+  - POL-101:0 source=doc1_handbook.txt score=0.570135 text='Northwind Robotics Employee Handbook Author: People Operations Team Document ID: POL-101 Version: 3.2 Effective date: 1 March 2026 Last review: 12 February 2026 Next review: 12 Aug'
+  - … 2 more chunks
+  --- step 3 ---
+  THINK    [northwind_faq_agent] propose tool call search_docs
+  ACT      [northwind_faq_agent] search_docs({'query': 'annual leave days holiday POL-101'})
+  --- step 4 ---
+  OBSERVE  [northwind_faq_agent] search_docs -> 
+status=ok query='annual leave days holiday POL-101' chunk_count=5
+  - POL-101:7 source=doc1_handbook.txt score=0.619248 text='Customer sites. Field engineers and deployment specialists follow the customer site access rules in SPEC-WB9 and the Security Policy (POL-207). Customer-site days count as in-offic'
+  - POL-101:8 source=doc1_handbook.txt score=0.501467 text='Booking leave. Submit requests in the HRIS at least 10 working days in advance for absences of three or more consecutive days. Peak blackout periods (for example final week of a ma'
+  - POL-101:21 source=doc1_handbook.txt score=0.467272 text='============================================================================== 14. DOCUMENT CONTROL AND RELATED POLICIES ==========================================================='
+  - … 2 more chunks
+  --- step 5 ---
+  ANSWER   [northwind_faq_agent] Northwind Robotics employees get **28 days** of annual leave, plus public holidays [POL-101]. 
+
+This is specified in the **Northwind Robotics Employee Handbook** under document ID **POL-101** [POL-101].
+
+=== DONE ===
+Northwind Robotics employees get **28 days** of annual leave, plus public holidays [POL-101]. 
+
+This is specified in the **Northwind Robotics Employee Handbook** under document ID **POL-101** [POL-101].
+

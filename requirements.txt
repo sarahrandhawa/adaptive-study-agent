@@ -1,0 +1,17 @@
+fastapi[standard]
+httpx
+openai
+python-dotenv
+streamlit
+
+# Session 3 — Google ADK FAQ agent
+google-adk>=1.0.0
+google-genai>=1.0.0
+
+# Session 2 — RAG with Pinecone (requires Python 3.12; see runtime.txt)
+langchain-core>=0.3.34,<2.0.0
+langchain-openai>=0.3.11
+langchain-text-splitters>=0.0.1
+langchain-pinecone==0.2.13
+pinecone>=6.0.0,<8.0.0
+pypdf>=3.0.0
