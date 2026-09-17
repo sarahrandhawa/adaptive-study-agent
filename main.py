@@ -2,6 +2,7 @@
 
 import time
 from pathlib import Path
+from typing import NoReturn
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -15,6 +16,12 @@ from retrieve import RetrieveValidationError, retrieve_chunks
 from vectorstore import VectorStoreConfigError, check_pinecone
 
 from memory_store import get_memory, save_memory, list_memories
+from study import (
+    StudyModelError,
+    StudyValidationError,
+    generate_quiz_question,
+    grade_student_answer,
+)
 
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -96,6 +103,50 @@ class MemoryRequest(BaseModel):
     user_id: str
     key: str
     value: str
+
+
+class QuizRequest(BaseModel):
+    topic: str
+    user_id: str = "demo-user"
+
+
+class QuizResponse(BaseModel):
+    status: str
+    question: str | None = None
+    topic: str
+    source_document_ids: list[str]
+    adaptive_focus: str | None = None
+    detail: str | None = None
+
+
+class GradeRequest(BaseModel):
+    question: str
+    student_answer: str
+    topic: str
+    user_id: str = "demo-user"
+
+
+class LearningProgress(BaseModel):
+    topic: str
+    mastery: str
+    attempts: int
+    correct: int
+    partial: int
+    incorrect: int
+    weak_concepts: list[str]
+
+
+class GradeResponse(BaseModel):
+    status: str
+    verdict: str | None = None
+    feedback: str | None = None
+    explanation: str | None = None
+    identified_gap: str | None = None
+    source_document_ids: list[str]
+    question: str | None = None
+    topic: str | None = None
+    learning_progress: LearningProgress | None = None
+    detail: str | None = None
 
 def _agent_user_text(body: AgentRequest) -> str:
     text = (body.message or body.goal or "").strip()
@@ -227,6 +278,51 @@ def ingest(body: IngestRequest) -> IngestResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return IngestResponse(**result)
+
+
+def _raise_study_http(exc: Exception) -> NoReturn:
+    """Map study/retrieval failures to the same HTTP codes as /ask and /ingest."""
+
+    if isinstance(exc, StudyValidationError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(exc, VectorStoreConfigError):
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if isinstance(exc, RetrieveValidationError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(exc, StudyModelError):
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if isinstance(exc, RuntimeError):
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    raise exc
+
+
+@app.post("/quiz")
+def quiz(body: QuizRequest) -> QuizResponse:
+    """Generate one grounded quiz question from ingested course materials."""
+
+    try:
+        result = generate_quiz_question(topic=body.topic, user_id=body.user_id)
+    except (StudyValidationError, VectorStoreConfigError, RetrieveValidationError, StudyModelError, RuntimeError) as exc:
+        _raise_study_http(exc)
+
+    return QuizResponse(**result)
+
+
+@app.post("/grade")
+def grade(body: GradeRequest) -> GradeResponse:
+    """Grade a student answer against retrieved course material and record compact mastery."""
+
+    try:
+        result = grade_student_answer(
+            question=body.question,
+            student_answer=body.student_answer,
+            topic=body.topic,
+            user_id=body.user_id,
+        )
+    except (StudyValidationError, VectorStoreConfigError, RetrieveValidationError, StudyModelError, RuntimeError) as exc:
+        _raise_study_http(exc)
+
+    return GradeResponse(**result)
 
 
 @app.post("/agent")
