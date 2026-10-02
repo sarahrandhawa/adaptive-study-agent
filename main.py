@@ -14,12 +14,16 @@ from rag import DEFAULT_RETRIEVAL_K, build_grounding_prompt
 from retrieve import RetrieveValidationError, retrieve_chunks
 from vectorstore import VectorStoreConfigError, check_pinecone
 
+from users import ensure_user
+
 from study import (
     StudyModelError,
     StudyValidationError,
     generate_quiz_question,
     grade_student_answer,
 )
+
+
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -34,6 +38,11 @@ MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
 if CHAT_MODEL not in MODEL_PRICES_PER_1K:
     raise ValueError(f"No pricing configured for CHAT_MODEL={CHAT_MODEL}")
 
+def current_user():
+    if os.getenv("ALLOW_DEV_USER", "false").lower() != "true":
+        raise RuntimeError("Dev user is disabled")
+
+    return ensure_user("dev", "dev-local")
 
 class Answer(BaseModel):
     """Structured model output — this is what turns a chatbot into a component."""
