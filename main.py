@@ -4,26 +4,26 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
+from datetime import datetime
+from uuid import UUID
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
-from ingest import IngestValidationError, ingest_text
+from ingest import IngestValidationError, ingest_document
 from rag import DEFAULT_RETRIEVAL_K, build_grounding_prompt
 from retrieve import RetrieveValidationError, retrieve_chunks
 from vectorstore import VectorStoreConfigError, check_pinecone
-
 from users import ensure_user
-
+from courses import create_course, list_courses
+from documents import delete_document, list_documents
 from study import (
-    StudyModelError,
     StudyValidationError,
     generate_quiz_question,
     grade_student_answer,
 )
-
-
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -38,11 +38,23 @@ MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
 if CHAT_MODEL not in MODEL_PRICES_PER_1K:
     raise ValueError(f"No pricing configured for CHAT_MODEL={CHAT_MODEL}")
 
-def current_user():
-    if os.getenv("ALLOW_DEV_USER", "false").lower() != "true":
-        raise RuntimeError("Dev user is disabled")
+def current_user(
+    x_google_sub: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
+    x_user_name: str | None = Header(default=None),
+):
+    if x_google_sub:
+        return ensure_user(
+            "google",
+            x_google_sub,
+            email=x_user_email,
+            name=x_user_name,
+        )
 
-    return ensure_user("dev", "dev-local")
+    if os.getenv("ALLOW_DEV_USER", "false").lower() == "true":
+        return ensure_user("dev", "dev-local")
+
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 class Answer(BaseModel):
     """Structured model output — this is what turns a chatbot into a component."""
@@ -55,6 +67,7 @@ class Answer(BaseModel):
 class AskRequest(BaseModel):
     """Typed request body so bad input is rejected before we spend tokens."""
 
+    course_id: UUID
     question: str
 
 class AskResponse(BaseModel):
@@ -69,20 +82,20 @@ class AskResponse(BaseModel):
 
 
 class IngestRequest(BaseModel):
-    document_id: str = Field(min_length=1)
-    text: str
-    source: str | None = None
+    course_id: UUID
+    filename: str = Field(min_length=1)
+    text: str = Field(min_length=1)
 
 
 class IngestResponse(BaseModel):
-    document_id: str
+    document_id: UUID
     chunks_indexed: int
     status: str
 
 
 class QuizRequest(BaseModel):
-    topic: str
-    user_id: str = "demo-user"
+    course_id: UUID
+    topic: str = Field(min_length=1)
 
 
 class QuizResponse(BaseModel):
@@ -95,10 +108,8 @@ class QuizResponse(BaseModel):
 
 
 class GradeRequest(BaseModel):
-    question: str
-    student_answer: str
-    topic: str
-    user_id: str = "demo-user"
+    question_id: UUID
+    answer: str = Field(min_length=1)
 
 
 class LearningProgress(BaseModel):
@@ -123,6 +134,20 @@ class GradeResponse(BaseModel):
     learning_progress: LearningProgress | None = None
     detail: str | None = None
 
+class CreateCourseRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+class CourseResponse(BaseModel):
+    id: UUID
+    name: str
+    created_at: datetime
+
+class DocumentResponse(BaseModel):
+    id: UUID
+    filename: str
+    char_count: int
+    chunk_count: int
+    created_at: datetime
 
 def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     """Turn real usage into dollars — same prompt, different model, different cost."""
@@ -159,51 +184,18 @@ def call_model_structured(prompt: str, model: str) -> tuple[Answer, int, int, in
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
-
-@app.get("/debug/pinecone")
-def debug_pinecone() -> dict:
-    """Confirm Pinecone credentials, index presence, and basic connectivity."""
-
-    return check_pinecone()
-
-
-@app.get("/debug/retrieve")
-def debug_retrieve(q: str, k: int = 5) -> dict:
-    """Embed a question and return top-k chunks with scores — no LLM call.
-
-    Example:
-        curl -s "http://127.0.0.1:8000/debug/retrieve?q=What%20is%20RAG%3F"
-    """
-
-    try:
-        return retrieve_chunks(query=q, k=k)
-    except RetrieveValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except VectorStoreConfigError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
 @app.post("/ingest")
-def ingest(body: IngestRequest) -> IngestResponse:
-    """Chunk, embed, and upsert a document into Pinecone.
-
-    Example:
-        curl -s -X POST http://127.0.0.1:8000/ingest \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "document_id": "rag-intro-001",
-            "text": "Retrieval Augmented Generation combines search with generation...",
-            "source": "sample_rag_document.txt"
-          }'
-    """
+def ingest(
+    body: IngestRequest,
+    user_id=Depends(current_user),
+    ) -> IngestResponse:
 
     try:
-        result = ingest_text(
-            document_id=body.document_id,
+        result = ingest_document(
+            user_id=user_id,
+            course_id=body.course_id,
+            filename=body.filename,
             text=body.text,
-            source=body.source,
         )
     except IngestValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -232,42 +224,68 @@ def _raise_study_http(exc: Exception) -> NoReturn:
 
 
 @app.post("/quiz")
-def quiz(body: QuizRequest) -> QuizResponse:
-    """Generate one grounded quiz question from ingested course materials."""
-
+def quiz(
+    body: QuizRequest,
+    user_id=Depends(current_user),
+):
     try:
-        result = generate_quiz_question(topic=body.topic, user_id=body.user_id)
-    except (StudyValidationError, VectorStoreConfigError, RetrieveValidationError, StudyModelError, RuntimeError) as exc:
-        _raise_study_http(exc)
-
-    return QuizResponse(**result)
+        return generate_quiz_question(
+            user_id=user_id,
+            course_id=body.course_id,
+            topic=body.topic,
+        )
+    except StudyValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
 
 
 @app.post("/grade")
-def grade(body: GradeRequest) -> GradeResponse:
-    """Grade a student answer against retrieved course material and record compact mastery."""
+def grade(
+    body: GradeRequest,
+    user_id=Depends(current_user),
+    ):
 
     try:
-        result = grade_student_answer(
-            question=body.question,
-            student_answer=body.student_answer,
-            topic=body.topic,
-            user_id=body.user_id,
+        return grade_student_answer(
+            user_id=user_id,
+            question_id=body.question_id,
+            student_answer=body.answer,
         )
-    except (StudyValidationError, VectorStoreConfigError, RetrieveValidationError, StudyModelError, RuntimeError) as exc:
-        _raise_study_http(exc)
-
-    return GradeResponse(**result)
+    except StudyValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
 
 
 @app.post("/ask")
-def ask(body: AskRequest) -> AskResponse:
+def ask(
+    body: AskRequest,
+    user_id=Depends(current_user),
+    ) -> AskResponse:
     """Answer one question with retrieval-augmented generation, guardrails, and cost visibility."""
 
     model = CHAT_MODEL
 
     try:
-        retrieval = retrieve_chunks(query=body.question, k=DEFAULT_RETRIEVAL_K)
+        retrieval = retrieve_chunks(
+            query=body.question,
+            k=DEFAULT_RETRIEVAL_K,
+            user_id=user_id,
+            course_id=body.course_id,
+        )
     except VectorStoreConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -299,3 +317,52 @@ def ask(body: AskRequest) -> AskResponse:
     except (ValidationError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
         
+@app.post("/courses", response_model=CourseResponse)
+def create_course_endpoint(
+    body: CreateCourseRequest,
+    user_id=Depends(current_user),
+    ):
+    
+
+    try:
+        course_id = create_course(user_id, body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    courses = list_courses(user_id)
+
+    for course in courses:
+        if course["id"] == course_id:
+            return CourseResponse(**course)
+
+    raise HTTPException(status_code=500, detail="Course was created but could not be loaded")
+
+
+@app.get("/courses", response_model=list[CourseResponse])
+def list_courses_endpoint(
+    user_id=Depends(current_user)
+    ):
+    return [CourseResponse(**course) for course in list_courses(user_id)]
+
+@app.get("/documents", response_model=list[DocumentResponse])
+def documents(
+    course_id: UUID,
+    user_id=Depends(current_user),
+    ):
+
+    return [
+        DocumentResponse(**document)
+        for document in list_documents(user_id, course_id)
+    ]
+
+
+@app.delete("/documents/{document_id}")
+def remove_document(
+    document_id: UUID,
+    user_id=Depends(current_user),
+    ):
+
+    if not delete_document(user_id, document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {"status": "deleted"}

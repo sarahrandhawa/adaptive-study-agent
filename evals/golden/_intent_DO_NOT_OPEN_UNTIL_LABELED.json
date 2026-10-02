@@ -1,0 +1,22 @@
+{
+  "G1-1": "partial",
+  "G1-2": "injected",
+  "G1-3": "correct",
+  "G1-4": "incorrect",
+  "G1-5": "paraphrase",
+  "G2-1": "paraphrase",
+  "G2-2": "incorrect",
+  "G2-3": "injected",
+  "G2-4": "partial",
+  "G2-5": "correct",
+  "G3-1": "correct",
+  "G3-2": "partial",
+  "G3-3": "paraphrase",
+  "G3-4": "injected",
+  "G3-5": "incorrect",
+  "G4-1": "incorrect",
+  "G4-2": "correct",
+  "G4-3": "partial",
+  "G4-4": "paraphrase",
+  "G4-5": "injected"
+}

@@ -98,8 +98,12 @@ def get_pinecone_index():
 
 
 @lru_cache
-def get_vector_store() -> PineconeVectorStore:
-    return PineconeVectorStore(index=get_pinecone_index(), embedding=get_embeddings())
+def get_vector_store(namespace: str | None = None) -> PineconeVectorStore:
+    return PineconeVectorStore(
+        index=get_pinecone_index(),
+        embedding=get_embeddings(),
+        namespace=namespace,
+    )
 
 
 def _jsonify(value: Any) -> Any:
@@ -178,3 +182,10 @@ def check_pinecone() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — surface connectivity issues in debug output
         result["error"] = f"{type(exc).__name__}: {exc}"
         return result
+
+def delete_vectors(*, namespace: str, ids: list[str]) -> None:
+    if not ids:
+        return
+
+    index = get_pinecone_index()
+    index.delete(ids=ids, namespace=namespace)

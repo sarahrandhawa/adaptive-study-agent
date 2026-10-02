@@ -1,0 +1,44 @@
+[
+  {
+    "id": "Q1",
+    "topic": "evaporation and transpiration"
+  },
+  {
+    "id": "Q2",
+    "topic": "evaporation and transpiration"
+  },
+  {
+    "id": "Q3",
+    "topic": "condensation and clouds"
+  },
+  {
+    "id": "Q4",
+    "topic": "condensation and clouds"
+  },
+  {
+    "id": "Q5",
+    "topic": "precipitation"
+  },
+  {
+    "id": "Q6",
+    "topic": "precipitation"
+  },
+  {
+    "id": "Q7",
+    "topic": "runoff and groundwater"
+  },
+  {
+    "id": "Q8",
+    "topic": "runoff and groundwater"
+  },
+  {
+    "id": "Q9",
+    "topic": "condensation and clouds",
+    "focus": "Kestrel line"
+  },
+  {
+    "id": "Q10",
+    "topic": "plate tectonics",
+    "expect": "insufficient_material"
+  }
+]

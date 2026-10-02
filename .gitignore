@@ -14,3 +14,4 @@ env/
 # Memory
 memory.json
 
+.streamlit/secrets.toml

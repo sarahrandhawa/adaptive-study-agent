@@ -1,6 +1,5 @@
 from db import get_conn
 
-
 def ensure_user(provider, subject, email=None, name=None):
     with get_conn() as conn:
         with conn.cursor() as cur:

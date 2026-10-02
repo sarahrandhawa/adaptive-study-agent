@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from io import BytesIO
 from pathlib import Path
 
@@ -17,9 +16,36 @@ import httpx
 import streamlit as st
 from pypdf import PdfReader
 
-API_BASE = "http://127.0.0.1:8000"
+import requests
+
+def auth_headers():
+    return {
+        "X-Google-Sub": st.user.sub,
+        "X-User-Email": st.user.email,
+        "X-User-Name": st.user.name,
+    }
+
 DEFAULT_API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000")
 TIMEOUT_SECONDS = 120.0
+
+
+def get_courses():
+    response = requests.get(
+        f"{DEFAULT_API_URL.rstrip('/')}/courses",
+        headers=auth_headers(),
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def create_course(name):
+    response = requests.post(
+        f"{DEFAULT_API_URL.rstrip('/')}/courses",
+        json={"name": name},
+        headers=auth_headers(),
+    )
+    response.raise_for_status()
+    return response.json()
 
 APP_CSS = """
 <style>
@@ -69,10 +95,15 @@ APP_CSS = """
 """
 
 
-def api_post(base_url: str, path: str, payload: dict) -> tuple[int, dict | str]:
-    url = f"{base_url.rstrip('/')}{path}"
+def api_post(path: str, payload: dict) -> tuple[int, dict | str]:
+    url = f"{DEFAULT_API_URL.rstrip('/')}{path}"
     try:
-        response = httpx.post(url, json=payload, timeout=TIMEOUT_SECONDS)
+        response = httpx.post(
+            url,
+            json=payload,
+            headers=auth_headers(),
+            timeout=TIMEOUT_SECONDS,
+        )
         try:
             return response.status_code, response.json()
         except json.JSONDecodeError:
@@ -81,26 +112,6 @@ def api_post(base_url: str, path: str, payload: dict) -> tuple[int, dict | str]:
         return 0, {"error": f"Cannot reach {url}. Check the API URL and that the service is running."}
     except httpx.HTTPError as exc:
         return 0, {"error": str(exc)}
-
-
-def document_id_from_filename(filename: str) -> str:
-    """Derive a Pinecone-safe document_id from an uploaded filename."""
-
-    stem = Path(filename).stem
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
-    return safe or "uploaded-document"
-
-
-def unique_document_id(base_id: str, used_ids: set[str]) -> str:
-    """Keep document_ids unique when several uploads share a filename."""
-
-    candidate = base_id
-    suffix = 2
-    while candidate in used_ids:
-        candidate = f"{base_id}-{suffix}"
-        suffix += 1
-    used_ids.add(candidate)
-    return candidate
 
 
 def extract_txt_text(file_bytes: bytes) -> str:
@@ -131,17 +142,17 @@ def extract_uploaded_text(filename: str, file_bytes: bytes) -> str:
     raise ValueError(f"Unsupported file type: {suffix or '(none)'}")
 
 
-def render_ingest_file_result(
-    *,
-    filename: str,
-    document_id: str,
-    status: int,
-    data: dict | str,
-) -> None:
-    """Show success or failure for one uploaded file after POST /ingest."""
+def render_ingest_file_result(*, filename: str, status: int, data: dict | str) -> None:
+    """Show a user-facing result for one uploaded file."""
 
     if status == 200 and isinstance(data, dict):
-        st.success(f"Added {filename}.")
+        state = data.get("status")
+        if state == "unchanged":
+            st.info(f"{filename} is already in this course.")
+        else:
+            chunks = data.get("chunks_indexed")
+            suffix = f" ({chunks} chunks indexed)" if chunks is not None else ""
+            st.success(f"Added {filename}{suffix}.")
     elif isinstance(data, dict) and data.get("error"):
         st.error(f"Could not add {filename}: {data['error']}")
     elif status >= 400:
@@ -150,20 +161,12 @@ def render_ingest_file_result(
     else:
         st.error(data if isinstance(data, str) else f"Could not add {filename}.")
 
-    with st.expander("Details"):
-        st.caption(f"Saved as `{document_id}`")
-        if isinstance(data, dict):
-            st.json(data)
-        else:
-            st.code(str(data), language="text")
-
 
 def render_ask_result(data: dict) -> None:
     answer = data.get("answer", {})
-    text = answer.get("answer", "")
+    answer_text = answer.get("answer", "")
     confidence = answer.get("confidence")
     sources_needed = answer.get("sources_needed", False)
-    chunk_ids = data.get("retrieved_chunk_ids", [])
 
     if sources_needed:
         st.warning("There isn't enough in your uploaded notes to answer that.")
@@ -171,31 +174,19 @@ def render_ask_result(data: dict) -> None:
         st.success("Answer from your notes")
 
     with st.container(border=True):
-        st.markdown(text)
+        st.markdown(answer_text)
 
-    with st.expander("View sources & details"):
-        if chunk_ids:
-            st.markdown("**Sources**")
-            st.code("\n".join(chunk_ids), language="text")
-        else:
-            st.caption("No source IDs returned.")
-        cols = st.columns(4)
-        cols[0].metric("Confidence", f"{confidence:.2f}" if confidence is not None else "—")
-        cols[1].metric("Tokens", data.get("tokens_used", "—"))
-        cols[2].metric("Latency (ms)", data.get("latency_ms", "—"))
-        cols[3].metric("Cost (USD)", data.get("cost_usd", "—"))
-        st.json(data)
+    if confidence is not None:
+        st.caption(f"Confidence: {confidence:.0%}")
 
 
 def init_quiz_state() -> None:
     defaults = {
         "quiz_topic": "",
         "quiz_question": None,
-        "quiz_source_ids": [],
+        "quiz_question_id": None,
         "quiz_grade": None,
         "quiz_notice": None,
-        "quiz_adaptive_focus": None,
-        "quiz_progress": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -207,54 +198,94 @@ def render_grade_result(data: dict) -> None:
     labels = {
         "correct": ("Correct", "success"),
         "partially_correct": ("Partially correct", "warning"),
-        "incorrect": ("Needs review · Incorrect", "error"),
+        "incorrect": ("Needs review", "error"),
     }
     label, level = labels.get(verdict, (verdict or "Ungraded", "info"))
-    message_fn = {"success": st.success, "warning": st.warning, "error": st.error, "info": st.info}[level]
+    message_fn = {
+        "success": st.success,
+        "warning": st.warning,
+        "error": st.error,
+        "info": st.info,
+    }[level]
     message_fn(label)
+
+    score = data.get("score")
+    mastery = data.get("mastery")
+    if score is not None or mastery is not None:
+        cols = st.columns(2)
+        cols[0].metric("Score", f"{score:.0%}" if score is not None else "—")
+        cols[1].metric("Question mastery", f"{mastery:.0%}" if mastery is not None else "—")
 
     with st.container(border=True):
         st.markdown("**Feedback**")
         st.write(data.get("feedback") or "—")
-        st.markdown("**Explanation**")
-        st.write(data.get("explanation") or "—")
+
+        explanation = data.get("explanation")
+        if explanation:
+            st.markdown("**Explanation**")
+            st.write(explanation)
+
+        missed = data.get("missed_points") or []
+        if missed:
+            st.markdown("**Review these points**")
+            for point in missed:
+                st.markdown(f"- {point}")
+
         gap = data.get("identified_gap")
         if gap:
             st.markdown("**Focus for next time**")
             st.write(gap)
 
-    with st.expander("View sources & details"):
-        source_ids = data.get("source_document_ids") or []
-        if source_ids:
-            st.code("\n".join(str(item) for item in source_ids), language="text")
-        else:
-            st.caption("No source document IDs returned.")
-        st.json(data)
-
-
-def render_learning_progress(data: dict) -> None:
-    st.markdown("**Learning progress**")
-    topic = data.get("topic") or "This topic"
-    st.caption(topic)
-    st.markdown(f"Mastery: **{data.get('mastery', 'Not assessed')}**")
-
-    cols = st.columns(4)
-    cols[0].metric("Attempts", data.get("attempts", 0))
-    cols[1].metric("Correct", data.get("correct", 0))
-    cols[2].metric("Partial", data.get("partial", 0))
-    cols[3].metric("Incorrect", data.get("incorrect", 0))
-
-    weak = data.get("weak_concepts") or []
-    st.markdown("**Focus areas**")
-    if weak:
-        for concept in weak:
-            st.markdown(f"- {concept}")
-    else:
-        st.caption("None recorded yet.")
-
 
 st.set_page_config(page_title="Adaptive Study Agent", layout="centered")
 st.markdown(APP_CSS, unsafe_allow_html=True)
+
+if not st.user.is_logged_in:
+    st.title("Adaptive Study Agent")
+    st.write("Sign in to start studying.")
+
+    if st.button("Sign in with Google"):
+        st.login()
+
+    st.stop()
+
+with st.sidebar:
+    st.write(f"Signed in as **{st.user.name}**")
+
+    if st.button("Log out"):
+        st.logout()
+
+
+
+courses = get_courses()
+
+if not courses:
+    st.title("Adaptive Study Agent")
+    st.subheader("Create your first course")
+
+    course_name = st.text_input(
+        "Course name",
+        placeholder="e.g. Biology 101",
+    )
+
+    if st.button("Create course"):
+        if course_name.strip():
+            create_course(course_name)
+            st.rerun()
+
+    st.stop()
+
+course_options = {
+    course["name"]: course["id"]
+    for course in courses
+}
+
+selected_course_name = st.selectbox(
+    "Course",
+    options=list(course_options.keys()),
+)
+
+selected_course_id = course_options[selected_course_name]
 
 st.title("Adaptive Study Agent")
 st.markdown(
@@ -269,20 +300,19 @@ st.markdown(
 )
 
 st.sidebar.markdown("**Study workspace**")
-st.sidebar.caption("Upload notes, ask questions, then practice.")
-
-with st.sidebar.expander("Developer settings"):
-    base_url = st.text_input(
-        "API base URL",
-        value=DEFAULT_API_URL,
-        help="Set RAG_API_URL in your environment to prefill this (no secrets needed).",
+st.sidebar.caption(f"Current course: {selected_course_name}")
+with st.sidebar.expander("+ New course"):
+    new_course_name = st.text_input(
+        "New course name",
+        placeholder="e.g. Biology 102",
+        key="new_course_name",
     )
-    if st.button("Check connection"):
-        try:
-            health = httpx.get(f"{base_url.rstrip('/')}/health", timeout=30.0)
-            st.write(f"HTTP {health.status_code}: {health.text}")
-        except httpx.HTTPError as exc:
-            st.error(str(exc))
+    if st.button("Create new course", key="create_new_course"):
+        if new_course_name.strip():
+            create_course(new_course_name)
+            st.rerun()
+        else:
+            st.warning("Enter a course name.")
 
 tab_ingest, tab_ask, tab_quiz = st.tabs(
     ["Study Materials", "Ask Your Materials", "Quiz Me"]
@@ -306,13 +336,8 @@ with tab_ingest:
         if not uploaded_files:
             st.warning("Choose one or more PDF or TXT files first.")
         else:
-            used_ids: set[str] = set()
             for uploaded in uploaded_files:
                 filename = uploaded.name or "uploaded-document"
-                document_id = unique_document_id(
-                    document_id_from_filename(filename),
-                    used_ids,
-                )
                 try:
                     extracted = extract_uploaded_text(filename, uploaded.getvalue()).strip()
                 except Exception as exc:  # extraction should never crash the page
@@ -326,40 +351,18 @@ with tab_ingest:
                     )
                     continue
 
-                payload = {
-                    "document_id": document_id,
+                ingest_payload = {
+                    "course_id": selected_course_id,
+                    "filename": filename,
                     "text": extracted,
-                    "source": filename,
                 }
                 with st.spinner(f"Adding {filename}…"):
-                    status, data = api_post(base_url, "/ingest", payload)
+                    status, data = api_post("/ingest", ingest_payload)
                 render_ingest_file_result(
                     filename=filename,
-                    document_id=document_id,
                     status=status,
                     data=data,
                 )
-
-    with st.expander("Advanced / Course Demo — paste text"):
-        st.caption("Manual ingest for course demos. Same POST /ingest contract as before.")
-        document_id = st.text_input("document_id", placeholder="POL-101")
-        source = st.text_input("source (optional)", placeholder="doc1_handbook.txt")
-        text = st.text_area("text", height=200, placeholder="Paste document text here…")
-
-        if st.button("Ingest pasted text"):
-            payload = {"document_id": document_id, "text": text}
-            if source.strip():
-                payload["source"] = source.strip()
-
-            with st.spinner("Adding pasted text…"):
-                status, data = api_post(base_url, "/ingest", payload)
-
-            if status == 200 and isinstance(data, dict):
-                st.success("Added pasted text to your study materials.")
-            elif status >= 400:
-                st.error(data.get("detail", data) if isinstance(data, dict) else data)
-            with st.expander("Details"):
-                st.json(data)
 
 with tab_ask:
     st.subheader("Ask your materials")
@@ -371,19 +374,19 @@ with tab_ask:
     )
 
     if st.button("Ask", type="primary"):
-        payload = {"question": question}
+        ask_payload = {
+            "course_id": selected_course_id,
+            "question": question,
+        }
         with st.spinner("Looking through your notes…"):
-            status, data = api_post(base_url, "/ask", payload)
+            status, data = api_post("/ask", ask_payload)
 
         if status == 200 and isinstance(data, dict):
             render_ask_result(data)
         elif status >= 400:
             st.error(data.get("detail", data) if isinstance(data, dict) else data)
-            with st.expander("View sources & details"):
-                st.json(data)
         else:
-            with st.expander("View sources & details"):
-                st.json(data)
+            st.error("Could not get an answer. Try again.")
 
 with tab_quiz:
     init_quiz_state()
@@ -406,22 +409,23 @@ with tab_quiz:
             if not topic:
                 st.session_state.quiz_notice = "Enter a topic first."
             else:
-                payload = {"topic": topic, "user_id": "demo-user"}
+                quiz_payload = {
+                    "course_id": selected_course_id,
+                    "topic": topic,
+                }
                 with st.spinner("Writing a question from your notes…"):
-                    status, data = api_post(base_url, "/quiz", payload)
+                    status, data = api_post("/quiz", quiz_payload)
 
                 if status == 200 and isinstance(data, dict) and data.get("status") == "ok":
                     st.session_state.quiz_question = data.get("question")
+                    st.session_state.quiz_question_id = data.get("question_id")
                     st.session_state.quiz_topic = data.get("topic") or topic
-                    st.session_state.quiz_source_ids = data.get("source_document_ids") or []
-                    st.session_state.quiz_adaptive_focus = data.get("adaptive_focus")
                     st.session_state.quiz_grade = None
                     st.session_state.quiz_notice = None
                     st.session_state.quiz_answer = ""
                 elif status == 200 and isinstance(data, dict):
                     st.session_state.quiz_question = None
                     st.session_state.quiz_grade = None
-                    st.session_state.quiz_adaptive_focus = None
                     st.session_state.quiz_notice = data.get("detail") or (
                         "Not enough course material was found for that topic."
                     )
@@ -438,11 +442,6 @@ with tab_quiz:
             st.markdown("**Question**")
             if st.session_state.quiz_topic:
                 st.caption(st.session_state.quiz_topic)
-            if st.session_state.quiz_adaptive_focus:
-                st.info(
-                    "Reviewing a concept you've struggled with: "
-                    f"{st.session_state.quiz_adaptive_focus}"
-                )
             st.markdown(st.session_state.quiz_question)
 
         st.markdown("**Your answer**")
@@ -459,18 +458,15 @@ with tab_quiz:
             if not student_answer:
                 st.session_state.quiz_notice = "Write an answer before submitting."
             else:
-                payload = {
-                    "question": st.session_state.quiz_question,
-                    "student_answer": student_answer,
-                    "topic": st.session_state.quiz_topic,
-                    "user_id": "demo-user",
+                grade_payload = {
+                    "question_id": st.session_state.quiz_question_id,
+                    "answer": student_answer,
                 }
                 with st.spinner("Checking your answer…"):
-                    status, data = api_post(base_url, "/grade", payload)
+                    status, data = api_post("/grade", grade_payload)
 
                 if status == 200 and isinstance(data, dict) and data.get("status") == "ok":
                     st.session_state.quiz_grade = data
-                    st.session_state.quiz_progress = data.get("learning_progress")
                     st.session_state.quiz_notice = None
                 elif status == 200 and isinstance(data, dict):
                     st.session_state.quiz_grade = None
@@ -495,7 +491,4 @@ with tab_quiz:
         st.markdown("**Result**")
         render_grade_result(st.session_state.quiz_grade)
 
-    if st.session_state.quiz_progress:
-        with st.container(border=True):
-            render_learning_progress(st.session_state.quiz_progress)
 
