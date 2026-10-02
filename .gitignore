@@ -10,3 +10,7 @@ __pycache__/
 venv/
 .venv/
 env/
+
+# Memory
+memory.json
+

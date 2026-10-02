@@ -14,11 +14,8 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
-import requests
 import streamlit as st
 from pypdf import PdfReader
-
-from memory_store import topic_progress
 
 API_BASE = "http://127.0.0.1:8000"
 DEFAULT_API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000")
@@ -190,32 +187,6 @@ def render_ask_result(data: dict) -> None:
         st.json(data)
 
 
-def render_agent_result(data: dict) -> None:
-    """Show POST /agent answer, model, and steps (Think / Act / Observe from tool events)."""
-
-    st.success("Agent answer")
-    st.markdown(data.get("answer") or "(no answer)")
-    st.caption(f"Model: `{data.get('model', '—')}`")
-
-    st.markdown("**Think → Act → Observe** (from `/agent` `steps[]`, not hidden model reasoning)")
-    steps = data.get("steps") or []
-    if not steps:
-        st.caption("No tool steps returned.")
-    for index, step in enumerate(steps, start=1):
-        tool = step.get("tool") or "unknown"
-        observation = str(step.get("observation") or "")
-        st.markdown(f"**Step {index}** — tool `{tool}`")
-        if observation.startswith("called"):
-            st.info(f"**Think** — model proposed `{tool}`")
-            st.warning(f"**Act** — `{tool}` {observation}")
-        else:
-            st.success(f"**Observe** — `{tool}` returned a real result")
-            st.code(observation, language="text")
-
-    with st.expander("Full JSON response"):
-        st.json(data)
-
-
 def init_quiz_state() -> None:
     defaults = {
         "quiz_topic": "",
@@ -313,8 +284,8 @@ with st.sidebar.expander("Developer settings"):
         except httpx.HTTPError as exc:
             st.error(str(exc))
 
-tab_ingest, tab_ask, tab_quiz, tab_advanced = st.tabs(
-    ["Study Materials", "Ask Your Materials", "Quiz Me", "Advanced / Course Demo"]
+tab_ingest, tab_ask, tab_quiz = st.tabs(
+    ["Study Materials", "Ask Your Materials", "Quiz Me"]
 )
 
 with tab_ingest:
@@ -399,11 +370,8 @@ with tab_ask:
         placeholder="What does this material say about the main topic?",
     )
 
-    with st.expander("Answer options"):
-        model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "o3-mini"], index=0)
-
     if st.button("Ask", type="primary"):
-        payload = {"question": question, "model": model}
+        payload = {"question": question}
         with st.spinner("Looking through your notes…"):
             status, data = api_post(base_url, "/ask", payload)
 
@@ -531,178 +499,3 @@ with tab_quiz:
         with st.container(border=True):
             render_learning_progress(st.session_state.quiz_progress)
 
-with tab_advanced:
-    st.caption("Course assignment tools. Not required for the student study flow.")
-    tab_agent, tab_trace, tab_memory = st.tabs(["Agent", "TRACE Eval", "Memory"])
-
-    with tab_agent:
-        st.subheader("Ask the ADK agent")
-        st.caption("Calls POST /agent — Gemini decides whether to run `search_docs` (Pinecone).")
-        agent_user_id = st.text_input(
-            "User ID",
-            value="demo-user",
-            key="agent_user_id",
-            help="Durable preferences saved for this user are loaded before the agent runs.",
-        )
-        agent_message = st.text_area(
-            "Agent question",
-            key="agent_message",
-            height=100,
-            placeholder="How many annual leave days do Northwind Robotics employees get, and which policy document ID says so?",
-        )
-
-        if st.button("Run agent", type="primary"):
-            payload = {
-                "message": agent_message,
-                "user_id": agent_user_id,
-            }
-            with st.spinner("Calling POST /agent…"):
-                status, data = api_post(base_url, "/agent", payload)
-
-            st.markdown(f"**HTTP {status}**")
-            if status == 200 and isinstance(data, dict):
-                render_agent_result(data)
-            elif isinstance(data, dict) and "error" in data:
-                st.error(data["error"])
-            elif status >= 400:
-                st.error(data.get("detail", data) if isinstance(data, dict) else data)
-            else:
-                st.error(data if isinstance(data, str) else "Unexpected response")
-                if isinstance(data, dict):
-                    st.json(data)
-
-    with tab_trace:
-        st.subheader("TRACE Evaluation")
-
-        st.write(
-            "Evaluation of 20 Northwind FAQ agent traces using "
-            "deterministic code-based checks."
-        )
-
-        st.markdown("### Before / After")
-
-        before_col, after_col = st.columns(2)
-
-        with before_col:
-            st.metric(
-                label="Before fix",
-                value="85%",
-                delta="17 / 20 passed",
-            )
-
-        with after_col:
-            st.metric(
-                label="After fix",
-                value="100%",
-                delta="+15 percentage points",
-            )
-
-        st.markdown("### Checks")
-
-        st.write("**1. Non-empty answer** — Agent must return a usable response.")
-        st.write("**2. Tool execution** — `search_docs` must be recorded in the agent trace.")
-
-        st.markdown("### Top failure")
-
-        st.warning(
-            "Empty agent response / no execution: "
-            "3 of the original 20 traces returned no answer and no tool steps."
-        )
-
-        st.markdown("### Fix")
-
-        st.success(
-            "Added graceful handling so an empty agent result no longer "
-            "silently returns a blank response."
-        )
-
-        st.markdown("### Result")
-
-        st.write("Baseline: **17/20 passed (85%)**")
-        st.write("After fix: **20/20 passed (100%)**")
-
-        if st.button("Show evaluation results"):
-            st.success("20 / 20 traces passed")
-            st.progress(1.0)
-            st.write("Overall pass rate: **100%**")
-
-    with tab_memory:
-        st.subheader("Durable Memory Demo")
-
-        st.write(
-            "Save a user preference, then retrieve it in a new session. "
-            "Memory is stored outside the chat context and survives process restarts."
-        )
-
-        memory_user_id = st.text_input(
-            "User ID",
-            value="demo-user",
-            key="memory_user_id",
-        )
-
-        st.markdown("### Save preference")
-
-        preference_type = st.selectbox(
-            "Preference",
-            [
-                "preferred_answer_style",
-                "preferred_language",
-                "preferred_name",
-            ],
-            key="memory_preference_type",
-        )
-
-        preference_value = st.text_input(
-            "Value",
-            value="Japanese",
-            key="memory_preference_value",
-        )
-
-        if st.button("Save preference"):
-            try:
-                response = requests.post(
-                    f"{API_BASE}/memory",
-                    json={
-                        "user_id": memory_user_id,
-                        "key": preference_type,
-                        "value": preference_value,
-                    },
-                    timeout=30,
-                )
-                response.raise_for_status()
-                st.success("Preference saved to durable memory.")
-                st.json(response.json())
-            except requests.RequestException as exc:
-                st.error(f"Could not save memory: {exc}")
-
-        st.markdown("### New session recall")
-
-        st.write(
-            "This retrieves durable memory from the backend. "
-            "It does not use Streamlit chat history."
-        )
-
-        if st.button("Recall saved memory"):
-            try:
-                response = requests.get(
-                    f"{API_BASE}/memory/{memory_user_id}",
-                    timeout=30,
-                )
-                response.raise_for_status()
-
-                recalled = response.json()
-
-                st.success("Durable memory retrieved.")
-
-                memory = recalled.get("memory") if isinstance(recalled, dict) else {}
-                if isinstance(memory, dict):
-                    mastery = memory.get("topic_mastery")
-                    if isinstance(mastery, dict) and mastery:
-                        st.markdown("### Learning progress")
-                        for topic_name, entry in mastery.items():
-                            render_learning_progress(topic_progress(str(topic_name), entry))
-
-                st.json(recalled)
-
-            except requests.RequestException as exc:
-                st.error(f"Could not retrieve memory: {exc}")
