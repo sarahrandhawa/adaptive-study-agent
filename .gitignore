@@ -15,3 +15,5 @@ env/
 memory.json
 
 .streamlit/secrets.toml
+
+.pytest_cache/

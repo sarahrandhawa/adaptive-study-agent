@@ -10,7 +10,8 @@ GROUNDING_PROMPT_TEMPLATE = """You are a grounded Q&A assistant. Answer the user
 
 Rules:
 - Use ONLY information from the retrieved context. Do not use outside knowledge.
-- When you use information from a chunk, cite its document_id in your answer (for example: [rag-intro-001]).
+- If you cite where information came from, use only the source file name shown in the context header (for example: (from biology-notes.pdf)).
+- Never include internal IDs, codes or bracketed identifiers in your answer.
 - If the retrieved context is insufficient to answer the question, say so clearly in your answer, use a low confidence score, and set sources_needed to true.
 
 Retrieved context:
@@ -20,12 +21,11 @@ Question: {question}"""
 
 
 def _format_chunk(chunk: dict[str, Any]) -> str:
-    header_parts = [f"chunk_id={chunk.get('chunk_id')}"]
-    if chunk.get("document_id") is not None:
-        header_parts.append(f"document_id={chunk['document_id']}")
-    if chunk.get("source"):
-        header_parts.append(f"source={chunk['source']}")
-    return f"[{' | '.join(header_parts)}]\n{chunk.get('text', '')}"
+    """Context block for the model. Only the human-readable file name is shown;
+    internal chunk and document IDs stay out of the prompt so they can't leak into answers."""
+
+    source = chunk.get("source") or "uploaded course material"
+    return f"[Source: {source}]\n{chunk.get('text', '')}"
 
 
 def build_grounding_prompt(*, question: str, chunks: list[dict[str, Any]]) -> tuple[str, list[str]]:

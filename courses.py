@@ -45,3 +45,42 @@ def list_courses(user_id):
         }
         for row in rows
     ]
+
+
+def user_owns_course(user_id, course_id) -> bool:
+    """True only when the course exists, is not archived, and belongs to this user."""
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM courses
+                WHERE id = %s
+                  AND user_id = %s
+                  AND archived_at IS NULL
+                """,
+                (course_id, user_id),
+            )
+
+            return cur.fetchone() is not None
+
+
+def archive_course(user_id, course_id) -> bool:
+    """Soft-delete: hide the course from the user's list. Study history is kept."""
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE courses
+                SET archived_at = now()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND archived_at IS NULL
+                RETURNING id
+                """,
+                (course_id, user_id),
+            )
+
+            return cur.fetchone() is not None

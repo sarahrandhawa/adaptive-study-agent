@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 from psycopg.types.json import Jsonb
 
-from memory_store import get_or_create_topic, weak_concepts_for_topic
+from memory_store import get_or_create_topic
 from rag import DEFAULT_RETRIEVAL_K, _format_chunk
 from retrieve import retrieve_chunks
 from db import get_conn
@@ -45,28 +45,6 @@ Retrieved course material:
 {context}
 """
 
-ADAPTIVE_QUIZ_PROMPT = """You are a study quiz generator. Create ONE question using ONLY the retrieved course material below.
-
-Rules:
-- Use ONLY the retrieved context. Never invent facts, vocabulary, numbers, or examples.
-- The question must be answerable from the retrieved context.
-- Prefer a question that tests understanding rather than asking the student to copy a sentence.
-- Generate one question for the student.
-- Also generate a reference answer using ONLY the retrieved context.
-- Generate 2-4 key points that a correct answer should contain.
-- Give the specific concept being tested a short concept_label of 6 words or fewer.
-- Do not put the reference answer or key points inside the question itself.
-- The student needs review on this concept: {focus}
-- If the retrieved material supports that review concept, write a question that tests it.
-- If the retrieved material does NOT support that concept, set sufficient_material to false. Do not invent a question from memory of the concept.
-
-Student topic: {topic}
-Review focus: {focus}
-
-Retrieved course material:
-{context}
-"""
-
 GRADE_PROMPT = """You are a grounded study tutor.
 
 Grade the student's answer using ONLY:
@@ -87,6 +65,9 @@ Rules:
 - explanation should explain what was expected using the source material.
 - identified_gap should describe the specific weakness revealed by the answer.
 - If the answer is correct, identified_gap should be null.
+- sufficient_material is about the SOURCE MATERIAL only, never the student's answer. Set it to true whenever the reference answer, key points and source material are enough to judge the answer — which is almost always.
+- An incomplete, vague or wrong student answer is still gradable: keep sufficient_material true and give it a low score.
+- Set sufficient_material to false only if the source material itself is missing or unrelated to the question, and explain why in insufficient_reason.
 
 Question:
 {question}
@@ -269,23 +250,6 @@ def _insufficient_quiz(topic: str, source_document_ids: list[str], detail: str) 
         "source_document_ids": source_document_ids,
         "adaptive_focus": None,
         "detail": detail,
-    }
-
-
-def _ok_quiz(
-    *,
-    topic: str,
-    question: str,
-    source_document_ids: list[str],
-    adaptive_focus: str | None,
-) -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "question": question,
-        "topic": topic,
-        "source_document_ids": source_document_ids,
-        "adaptive_focus": adaptive_focus,
-        "detail": None,
     }
 
 
