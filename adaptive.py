@@ -1,5 +1,23 @@
 from datetime import datetime, timedelta
 
+# Score thresholds shared by grading verdicts and progress bands (both are on the 0-1 scale).
+CORRECT_THRESHOLD = 0.85
+PARTIAL_THRESHOLD = 0.35
+
+
+def mastery_band(mastery):
+    """Label a mastery value with the same cutoffs used for grading verdicts.
+    None means no answered questions yet, which is not the same as low mastery."""
+
+    if mastery is None:
+        return "not_practiced"
+    if mastery >= CORRECT_THRESHOLD:
+        return "mastered"
+    if mastery >= PARTIAL_THRESHOLD:
+        return "developing"
+    return "needs_review"
+
+
 def update_mastery(old_mastery, score):
     return (old_mastery * 0.6) + (score * 0.4)
 

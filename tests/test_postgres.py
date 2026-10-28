@@ -9,45 +9,21 @@ throwaway schema and drops it afterwards. Example:
         .venv/bin/python -m pytest -m postgres
 """
 
-import os
 import threading
 import uuid
-from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
 
 import study
+from pg_support import ROOT, disposable_schema
 
 pytestmark = pytest.mark.postgres
-
-ROOT = Path(__file__).resolve().parent.parent
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "").strip()
 
 
 @pytest.fixture
 def pg(monkeypatch):
-    import psycopg
-
-    host = urlparse(TEST_DATABASE_URL).hostname
-    if host not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.fail(f"TEST_DATABASE_URL must point at a local disposable database, not {host!r}")
-
-    schema = f"asa_test_{uuid.uuid4().hex[:12]}"
-
-    def connect():
-        return psycopg.connect(TEST_DATABASE_URL, options=f"-c search_path={schema}")
-
-    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as admin:
-        admin.execute(f"CREATE SCHEMA {schema}")
-    try:
-        with connect() as conn:
-            conn.execute((ROOT / "schema.sql").read_text())
-        monkeypatch.setattr(study, "get_conn", connect)
+    with disposable_schema(monkeypatch, [study]) as connect:
         yield connect
-    finally:
-        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as admin:
-            admin.execute(f"DROP SCHEMA {schema} CASCADE")
 
 
 def seed(connect):

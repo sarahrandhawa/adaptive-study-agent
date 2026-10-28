@@ -2,7 +2,50 @@
 
 Date: 2026-10-28. All results below come from runs in this repository's `.venv` (Python 3.12.13, pytest 9.1.1, pytest-cov 7.1.0). No production database, Pinecone index or paid OpenAI endpoint was contacted.
 
-## Results
+## Branch `feature/progress-library-chunk-integrity` (2026-10-28)
+
+Scope: the progress dashboard, the question bank, and deleted-document / chunk integrity. Measured with the same tools as below. Real-SQL tests ran against a disposable local **Postgres 16.15** container; Supabase was never contacted.
+
+| Run | Passed | Failed | Skipped |
+|---|---|---|---|
+| Baseline on `main` (`913ab5e`) | 247 | 0 | 5 |
+| Baseline on `main`, `-m postgres` (local container) | 4 | 0 | — |
+| **Branch, `pytest` (312 collected)** | **298** | **0** | **14** (13 `postgres`, 1 `integration`) |
+| **Branch, with `TEST_DATABASE_URL` set** | **311** | **0** | **1** (live-Supabase `integration` only) |
+| Branch, `-m regression` | 19 | 0 | — |
+| Branch, handwritten and course-duplicate tests | 26 | 0 | — |
+
+**Coverage** (`--cov`, the same `.coveragerc`):
+
+| Scope | `main` | Branch |
+|---|---|---|
+| Backend (excludes `rag_ui.py`, `check_db_connection.py`, `ui_views.py`, `scripts/`) | 97% (742 stmts) | **98%** (936 stmts, 22 missed) |
+| Backend including `ui_views.py` and `scripts/` | — | 97% (1071 stmts) |
+| `ui_views.py` (rendered with Streamlit AppTest) | — | 96% |
+| All app modules, including `rag_ui.py` | 65% | 72% |
+
+New modules: `progress.py` 100%, `sources.py` 100%, `questions.py` 100%, `documents.py` 100%, `retrieve.py` 100%. `adaptive.py` is at 73%; the misses are the unused `next_due`.
+
+**Mutation check.** With the live-chunk conditions and the retrieval filter deliberately disabled, 4 of the real-Postgres tests failed (retrieval, failed-purge, grading/practice, recent activity). They passed again once the code was restored, so the tests detect leakage of deleted content.
+
+**End-to-end HTTP smoke test.** A real uvicorn server ran from an isolated copy (no `.env`) against a fresh local database, with Pinecone unconfigured on purpose:
+
+| Check | Result |
+|---|---|
+| New endpoints require auth | 401 without the key; 404 for another user's question bank |
+| Progress dashboard | Bands `needs_review` / `developing`, focus topics weakest first, overview per course |
+| Question bank | One row per question, stored model answer included |
+| `DELETE` with Pinecone down | 200; repeating it is also 200; the purge is recorded as pending and logged |
+| After the delete | Bank and practice drop the question, recent activity hides its text, history is kept, and `/grade` returns 400 without an LLM call |
+
+**Intentional test changes.** These existing tests asserted behaviour this branch deliberately changes; each keeps its original intent:
+
+- **`test_data_access.py::test_delete_document_soft_deletes_first_then_purges_vectors`** (was `…removes_vectors_then_soft_deletes`). The order is now Postgres first, then Pinecone, and the test asserts that new order.
+- **`test_ingest_retrieve.py::test_ingest_new_version_retires_old_document_then_purges_after_commit`.** The purge now happens after commit, and the updates are scoped to the user.
+- **`test_ingest_retrieve.py::test_retrieve_scopes_to_user_namespace_and_course`.** It now expects the 2× over-fetch and the Postgres check, and uses a real UUID chunk id; non-UUIDs are dropped before reaching SQL.
+- **`tests/test_postgres.py`.** The fixture moved to `tests/pg_support.py`; the tests themselves are unchanged.
+
+## Results (previous rounds)
 
 | Run | Passed | Failed | Skipped |
 |---|---|---|---|
@@ -17,7 +60,7 @@ Date: 2026-10-28. All results below come from runs in this repository's `.venv` 
 The 4 skipped tests are all opt-in:
 
 - 1 `integration` test (live database, `RUN_INTEGRATION=1`).
-- 4 `postgres` tests (local disposable database, `TEST_DATABASE_URL`). **These have not been executed yet.** No local Postgres was available because the Docker daemon was not running.
+- 4 `postgres` tests (local disposable database, `TEST_DATABASE_URL`). These were not executed in that round because the Docker daemon wasn't running. **They have since passed (4 of 4) against local Postgres 16.15;** see the branch section above.
 
 ## Coverage (application modules; tests, `course/` and `evals/` excluded)
 
@@ -100,7 +143,7 @@ Not verified:
 
 ## Remaining risks
 
-- **Real-SQL tests not executed.** `pg_advisory_xact_lock(hashtext…)`, the submission query, migration 001 and its rollback are validated only by fakes until `-m postgres` runs against a local Postgres. **This is the main blocker before deploying.**
+- ~~Real-SQL tests not executed.~~ **Resolved:** `pg_advisory_xact_lock(hashtext…)`, the submission query, and migration 001 with its rollback all passed against local Postgres 16.15.
 - **Spoofable identity.** Header identity is trusted behind the shared secret, and the production guard applies only on Render or with `APP_ENV=production`.
 - **Deleted documents.** `load_question_for_grading` doesn't filter deleted chunks.
 - **Prompt injection.** It is untested and needs live-model evals.

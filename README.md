@@ -13,7 +13,9 @@ Generic chatbots answer from general knowledge, not from the student's syllabus,
 - **Grounded Q&A (`/ask`):** retrieval-augmented answers with a confidence score, a "sources needed" flag, and the token count, latency and cost of each call.
 - **Quiz generation (`/quiz`):** generates one question per request using only the retrieved material, with a reference answer and key points (drafts missing either are rejected), or reuses a question from the existing bank when that's the better choice.
 - **Rubric grading (`/grade`):** the LLM scores 0–1 against the stored reference answer and key points. The **verdict is decided in code** from that score, and the attempt is recorded once even if the client retries.
-- **Progress tracking:** per-question mastery, attempt count, correct streak and recency.
+- **Progress dashboard:** per-course and per-topic mastery, the topics to focus on next, questions answered, average score and recent activity. Topics with no graded answers are labelled *not practiced*, never shown as 0%. Estimates based on fewer than three answers are flagged as early.
+- **Question bank:** every saved question once per course, grouped by topic. The stored model answer and key points are hidden behind an expander. Nothing is regenerated, and no LLM call is made to display it.
+- **Source integrity:** content from deleted or replaced documents (or archived courses) can't reach retrieval, new questions, practice or grading, even if Pinecone still holds its vectors.
 
 ## Tech stack
 
@@ -61,6 +63,21 @@ Generic chatbots answer from general knowledge, not from the student's syllabus,
 
 **Isolation:** every SQL query filters by `user_id`. Pinecone vectors live in a namespace per user, and retrieval is filtered by `course_id`. Another user's course returns 404.
 
+**Source of truth for content: Postgres, not Pinecone.** Pinecone is treated as a cache that can be stale. Deletes are eventually consistent, a vector purge can fail, and a rolled-back ingest can leave orphan vectors behind. So the rule in `sources.py` applies everywhere:
+
+- **Live chunk:** a chunk is *live* only if its row isn't deleted, its document is `active`, and its course isn't archived.
+- **Retrieval:** `retrieve_chunks` over-fetches 2× from Pinecone and keeps only matches that Postgres confirms are live.
+- **Grading:** uses only a question's live source chunks; if none remain, it returns 400 without calling the LLM.
+- **Practice and listings:** question selection, the question bank and the past-questions list only include questions with at least one live source.
+
+Deleting a document runs in this order:
+
+1. **Postgres first:** the document is marked deleted, in a transaction that also locks its row, and that commits. The content is unusable from this point.
+2. **Vectors second:** the document's vectors are removed from the owner's namespace, and `documents.vectors_deleted_at` is set.
+3. **On Pinecone failure:** the request still succeeds and the purge stays pending. A repeated `DELETE` (which is idempotent) or `scripts/purge_deleted_vectors.py` retries it.
+
+Replacing a document with a new version follows the same pattern.
+
 ## How the adaptive algorithm works
 
 This is a **deterministic heuristic, not a trained machine-learning model.** No model is trained or fine-tuned on student data. The LLM is used only to write questions and to score an answer against a rubric; all adaptation decisions are plain arithmetic in `adaptive.py` and `study.py`.
@@ -80,6 +97,19 @@ This is a **deterministic heuristic, not a trained machine-learning model.** No 
    - An unanswered existing question wins ties, so the bank is used before new questions are paid for.
    - Effect: weak, stale questions come back; fresh mistakes wait a while; well-mastered topics review existing questions instead of generating more.
 
+## Progress metrics
+
+All progress metrics are read-only views of the adaptive model's existing numbers (`progress.py`). There is no second scoring scheme.
+
+| Metric | Definition |
+|---|---|
+| Topic mastery | Mean `question_state.mastery` over the topic's answered questions: the same aggregation `get_topic_mastery` uses to pick questions. The dashboard reports "no data" as *not practiced*, where the selector uses 0.5. |
+| Course mastery | The same mean over all answered questions in the course |
+| Band | `mastered` ≥ 0.85 · `developing` ≥ 0.35 · `needs_review` < 0.35 · `not_practiced` = no answers. These are the grading verdict thresholds (`adaptive.py`). |
+| Focus next | Practised topics that aren't mastered, weakest first (top 3) |
+| Average score / correct rate | From recorded attempts, including attempts on questions whose source was later deleted. The history is kept, but those questions' text is hidden. |
+| Questions in bank | Questions that are still practicable (have live source material) |
+
 ## API endpoints
 
 All endpoints except `/health` require authentication. In production that means `X-API-Key` (the shared secret) plus `X-Google-Sub`.
@@ -92,8 +122,11 @@ All endpoints except `/health` require authentication. In production that means 
 | DELETE | `/courses/{course_id}` | Archive (soft-delete) a course |
 | POST | `/ingest` | Add a document `{course_id, filename, text}`. An identical re-upload returns `unchanged`; a new version replaces the old one. |
 | GET | `/documents?course_id=` | List documents in a course |
-| DELETE | `/documents/{document_id}` | Delete a document and its vectors |
+| DELETE | `/documents/{document_id}` | Delete a document, then its vectors. Repeating the request is safe and retries a pending vector purge. |
 | GET | `/questions?course_id=` | Question history with mastery (never includes answers) |
+| GET | `/question-bank?course_id=` | Saved questions with stored model answers and key points, one row per question |
+| GET | `/progress` | Progress summary for each of your courses |
+| GET | `/courses/{course_id}/progress` | Course summary, per-topic mastery, focus topics, recent activity |
 | POST | `/quiz` | Next question `{course_id, topic ≤ 200 chars}` |
 | POST | `/grade` | Grade `{question_id, answer ≤ 10,000 chars, submission_id?}` |
 | POST | `/ask` | Grounded answer `{course_id, question ≤ 1,000 chars}` |
@@ -154,6 +187,7 @@ python -m pytest --cov --cov-report=term-missing
 
 - **Isolation:** `conftest.py` stops the app from reading `.env`, injects fake credentials, and blocks outbound TCP, `psycopg.connect` and the OpenAI clients. A test that tries to reach a real service fails.
 - **Fakes:** an in-memory Postgres stand-in models commit, rollback and lock semantics, so duplicate and concurrent submissions can be reproduced deterministically.
+- **UI views:** the Progress and Question Bank tabs live in `ui_views.py` and are rendered in tests with Streamlit's `AppTest` using canned API responses.
 - **Opt-in suites:**
   - `-m postgres`: real-SQL checks against a **local disposable** Postgres (`TEST_DATABASE_URL`; non-local hosts are refused).
   - `-m integration` with `RUN_INTEGRATION=1`: live database checks. Run these deliberately.
@@ -177,16 +211,20 @@ In production the API refuses to start if `ALLOW_DEV_USER=true` or `API_SHARED_S
 - **Order:** apply each migration *before* deploying the code that depends on it.
 - **Migration 001** (`001_attempts_submission_id.sql`) adds `attempts.submission_id` plus the unique index `attempts_user_submission_key (user_id, submission_id)`. It is idempotent and backward compatible: the previous code leaves the column `NULL`, and NULLs never conflict.
 - **Fresh databases:** `schema.sql` already includes the same column and index.
+- **Migration 003** (`003_document_vector_purge.sql`) adds `documents.vectors_deleted_at` and a partial index of pending purges. It backfills existing deleted or replaced documents as already purged; that's accurate because the previous code removed vectors *before* marking a document deleted. It's additive, safe to re-run, and ignored by the previous code.
+- **Vector cleanup:** `python scripts/purge_deleted_vectors.py` lists pending purges (a dry run by default); `--apply` removes them. Stale vectors are never served either way, because retrieval re-checks Postgres.
 - **Connection pooling:** concurrency control uses a *transaction-scoped* advisory lock (`pg_advisory_xact_lock`), so it works through Supabase's transaction-mode pooler. Don't replace it with a session-level lock.
 
 ## Limitations and future work
 
 - **Identity trust:** the API trusts identity headers from the UI, protected by the shared secret. A deployment that isn't on Render and doesn't set `APP_ENV=production` only logs a warning when the secret is missing. Verifying the Google ID token in the API would remove this trust.
 - **Spaced repetition isn't wired in.** `adaptive.next_due` exists, but nothing calls it and `question_state.next_due_at` is never written. Scheduling is driven only by the recency penalty.
-- **Deleted documents:** grading doesn't filter deleted source chunks, so questions from a deleted document can still be served and graded against the old text.
+- **Orphan vectors from failed ingests:** if an ingest's database transaction rolls back after the Pinecone upsert, those vectors have no Postgres row. They're never served, but only a Pinecone-side audit (listing the namespace) can find and remove them; the purge script only knows about recorded documents.
+- **Archived courses keep their vectors:** archiving hides a course and everything derived from it, but its vectors stay in Pinecone, so un-archiving can be supported later.
+- **Revealing answers:** the question bank lets students read a model answer before attempting that question in practice. That's intended for revision, but it can inflate later scores on that question.
 - **No question deduplication:** generated questions aren't checked against the existing bank, and topic rows are created even when no material is found.
 - **No prompt-injection defence:** student answers are inserted into the grading prompt without delimiters. This needs adversarial evals against the golden set in `evals/golden/`.
 - **No rate limiting:** the `usage_daily` table is unused.
 - **Row-level security:** RLS is enabled, but no policies are defined. Access control is enforced in the API.
-- **Untested areas:** the Streamlit UI has no automated tests. The real-SQL suite (`-m postgres`) has to be run against a local Postgres; until then, the locking and migration SQL are verified only by in-memory fakes.
+- **Untested areas:** the main Streamlit page (sign-in and tab wiring) has no automated test. Only the Progress and Question Bank views are rendered in tests. The real-SQL suite (`-m postgres`) runs only when a local Postgres is provided.
 - **In-flight retries:** a retry sent while the first request is still being graded costs a second LLM call. The lock still records only one attempt.

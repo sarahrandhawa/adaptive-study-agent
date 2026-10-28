@@ -33,8 +33,13 @@ create table documents(
     status text,
     replaces_document_id uuid references documents(id) on delete restrict,
     created_at timestamptz default now(),
-    deleted_at timestamptz
+    deleted_at timestamptz,
+    vectors_deleted_at timestamptz
 );
+
+-- Same as migrations/003: deleted/replaced documents whose vectors still need purging.
+create index documents_pending_vector_purge on documents (deleted_at)
+    where status in ('deleted', 'replaced') and vectors_deleted_at is null;
 
 create table chunks(
     id uuid default gen_random_uuid() primary key,

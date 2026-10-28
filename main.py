@@ -20,7 +20,8 @@ load_dotenv(_ENV_PATH)
 from courses import archive_course, create_course, list_courses, user_owns_course  # noqa: E402
 from documents import delete_document, list_documents  # noqa: E402
 from ingest import IngestValidationError, ingest_document  # noqa: E402
-from questions import list_questions  # noqa: E402
+from progress import course_progress, progress_overview  # noqa: E402
+from questions import list_question_bank, list_questions  # noqa: E402
 from rag import DEFAULT_RETRIEVAL_K, build_grounding_prompt  # noqa: E402
 from retrieve import RetrieveValidationError, retrieve_chunks  # noqa: E402
 from study import (  # noqa: E402
@@ -179,6 +180,60 @@ class QuestionSummary(BaseModel):
     last_attempt_at: datetime | None = None
 
 
+class QuestionBankItem(BaseModel):
+    id: UUID
+    prompt: str
+    reference_answer: str | None = None
+    key_points: list[str] = []
+    concept_label: str | None = None
+    created_at: datetime
+    topic_id: UUID | None = None
+    topic: str | None = None
+    attempt_count: int = 0
+    mastery: float | None = None
+    last_attempt_at: datetime | None = None
+
+
+class ProgressStats(BaseModel):
+    questions_in_bank: int
+    questions_answered: int
+    attempts: int
+    average_score: float | None
+    correct_rate: float | None
+    mastery: float | None
+    mastery_band: str
+    low_data: bool
+
+
+class CourseProgressSummary(ProgressStats):
+    course_id: UUID
+    name: str
+    last_activity_at: datetime | None
+    attempts_last_7_days: int
+
+
+class TopicProgress(ProgressStats):
+    topic_id: UUID
+    name: str
+    last_attempt_at: datetime | None
+
+
+class RecentAttempt(BaseModel):
+    attempted_at: datetime
+    verdict: str | None
+    score: float | None
+    question: str | None
+    topic: str | None
+    source_removed: bool
+
+
+class CourseProgress(CourseProgressSummary):
+    topics: list[TopicProgress]
+    focus_topics: list[str]
+    not_practiced_topics: list[str]
+    recent_activity: list[RecentAttempt]
+
+
 def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     prices = MODEL_PRICES_PER_1K.get(model, MODEL_PRICES_PER_1K[CHAT_MODEL])
     input_per_1k, output_per_1k = prices
@@ -290,6 +345,27 @@ def remove_document(document_id: UUID, user_id=Depends(current_user)):
 def questions(course_id: UUID, user_id=Depends(current_user)):
     require_course(user_id, course_id)
     return [QuestionSummary(**question) for question in list_questions(user_id, course_id)]
+
+
+@app.get("/question-bank", response_model=list[QuestionBankItem])
+def question_bank(course_id: UUID, user_id=Depends(current_user)):
+    """Stored questions with their saved model answers. No generation happens here."""
+
+    require_course(user_id, course_id)
+    return [QuestionBankItem(**item) for item in list_question_bank(user_id, course_id)]
+
+
+@app.get("/progress", response_model=list[CourseProgressSummary])
+def progress(user_id=Depends(current_user)):
+    return progress_overview(user_id, list_courses(user_id))
+
+
+@app.get("/courses/{course_id}/progress", response_model=CourseProgress)
+def course_progress_endpoint(course_id: UUID, user_id=Depends(current_user)):
+    course = next((c for c in list_courses(user_id) if str(c["id"]) == str(course_id)), None)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    return course_progress(user_id, course)
 
 
 @app.post("/quiz")
