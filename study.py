@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from openai import APIError, OpenAI
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
 from datetime import datetime, timezone
@@ -236,7 +237,9 @@ def _call_structured(prompt: str, schema: type[BaseModel]) -> BaseModel:
             if parsed is None:
                 raise ValueError("Model returned no parseable structured output")
             return parsed
-        except (ValueError, APIError) as exc:
+        # OpenAIError, not just APIError: truncated or filtered responses
+        # (LengthFinishReasonError, ContentFilterFinishReasonError) are not APIErrors.
+        except (ValueError, OpenAIError) as exc:
             last_error = exc
             continue
     raise StudyModelError(str(last_error) if last_error else "Model call failed")
@@ -257,7 +260,7 @@ def _question_from_prompt(prompt: str) -> tuple[QuizDraft | None, str]:
     draft = _call_structured(prompt, QuizDraft)
     assert isinstance(draft, QuizDraft)
 
-    if not draft.sufficient_material or not draft.question.strip():
+    if not draft.sufficient_material or not draft.question.strip() or not draft.reference_answer.strip() or not draft.key_points:
         return None, (
             draft.insufficient_reason.strip()
             or "The retrieved material is not enough to write a fair question on that topic."
@@ -431,6 +434,59 @@ def load_question_for_grading(*, user_id, question_id):
         ],
     }
 
+def _load_submission(cur, *, user_id, submission_id):
+    cur.execute(
+        """
+        SELECT
+            a.id,
+            a.question_id,
+            a.verdict,
+            a.score,
+            a.missed_points,
+            a.feedback,
+            a.explanation,
+            a.identified_gap,
+            qs.mastery,
+            qs.attempt_count,
+            qs.correct_streak
+        FROM attempts a
+        LEFT JOIN question_state qs
+            ON qs.user_id = a.user_id
+           AND qs.question_id = a.question_id
+        WHERE a.user_id = %s
+          AND a.submission_id = %s
+        """,
+        (user_id, submission_id),
+    )
+
+    row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "attempt_id": row[0],
+        "question_id": row[1],
+        "verdict": row[2],
+        "score": row[3],
+        "missed_points": row[4] or [],
+        "feedback": row[5],
+        "explanation": row[6],
+        "identified_gap": row[7],
+        "mastery": row[8],
+        "attempt_count": row[9],
+        "correct_streak": row[10],
+    }
+
+
+def find_submission(*, user_id, submission_id):
+    """The attempt already recorded for this submission_id, or None."""
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            return _load_submission(cur, user_id=user_id, submission_id=submission_id)
+
+
 def record_attempt(
     *,
     user_id,
@@ -442,9 +498,27 @@ def record_attempt(
     feedback,
     explanation,
     identified_gap,
+    submission_id=None,
 ):
     with get_conn() as conn:
         with conn.cursor() as cur:
+
+            # Serialize attempts on the same (user, question) so concurrent
+            # submissions can't overwrite each other's state. Unlike
+            # SELECT ... FOR UPDATE, this also works before the first
+            # question_state row exists. Released at commit/rollback.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                (str(user_id), str(question_id)),
+            )
+
+            # A concurrent retry of this submission may have committed first.
+            if submission_id is not None:
+                existing = _load_submission(cur, user_id=user_id, submission_id=submission_id)
+                if existing is not None:
+                    if str(existing["question_id"]) != str(question_id):
+                        raise StudyValidationError("submission_id was already used for a different question")
+                    return {**existing, "replayed": True}
 
             # Get the question's current learner state.
             cur.execute(
@@ -494,11 +568,12 @@ def record_attempt(
                     explanation,
                     identified_gap,
                     grader_model,
-                    grader_version
+                    grader_version,
+                    submission_id
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id, created_at
                 """,
@@ -514,6 +589,7 @@ def record_attempt(
                     identified_gap,
                     DEFAULT_STUDY_MODEL,
                     "v1",
+                    submission_id,
                 ),
             )
 
@@ -561,11 +637,36 @@ def record_attempt(
         "correct_streak": new_correct_streak,
     }
 
+def _replayed_response(question, attempt) -> dict[str, Any]:
+    """The stored result for a submission that was already graded (client retry)."""
+
+    return {
+        "status": "ok",
+        "question_id": attempt["question_id"],
+        "attempt_id": attempt["attempt_id"],
+        "verdict": attempt["verdict"],
+        "score": attempt["score"],
+        "mastery": attempt["mastery"],
+        "attempt_count": attempt["attempt_count"],
+        "correct_streak": attempt["correct_streak"],
+        "missed_points": attempt["missed_points"],
+        "feedback": attempt["feedback"],
+        "explanation": attempt["explanation"],
+        "identified_gap": attempt["identified_gap"],
+        "reference_answer": question["reference_answer"],
+        "concept_label": question["concept_label"],
+        "topic": question["topic"],
+        "detail": None,
+        "replayed": True,
+    }
+
+
 def grade_student_answer(
     *,
     user_id,
     question_id,
     student_answer: str,
+    submission_id=None,
 ) -> dict[str, Any]:
 
     student_answer = student_answer.strip()
@@ -577,6 +678,14 @@ def grade_student_answer(
         user_id=user_id,
         question_id=question_id,
     )
+
+    # Retried submission: return the recorded result without re-grading.
+    if submission_id is not None:
+        previous = find_submission(user_id=user_id, submission_id=submission_id)
+        if previous is not None:
+            if str(previous["question_id"]) != str(question_id):
+                raise StudyValidationError("submission_id was already used for a different question")
+            return _replayed_response(question, previous)
 
     chunks = question["chunks"]
 
@@ -596,7 +705,7 @@ def grade_student_answer(
     draft = _call_structured(prompt, GradeDraft)
     assert isinstance(draft, GradeDraft)
 
-    if not draft.sufficient_material or draft.score is None:
+    if not draft.sufficient_material or draft.score is None or not math.isfinite(draft.score):
         return {
             "status": "insufficient_material",
             "question_id": question_id,
@@ -637,7 +746,11 @@ def grade_student_answer(
         feedback=draft.feedback.strip(),
         explanation=draft.explanation.strip(),
         identified_gap=identified_gap,
+        submission_id=submission_id,
     )
+
+    if attempt.get("replayed"):
+        return _replayed_response(question, attempt)
 
     return {
         "status": "ok",

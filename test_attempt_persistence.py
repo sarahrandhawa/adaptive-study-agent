@@ -1,5 +1,9 @@
+import pytest
+
 from db import get_conn
 
+# Reads the live Postgres database from DATABASE_URL. Skipped unless RUN_INTEGRATION=1.
+pytestmark = pytest.mark.integration
 
 USER_PROVIDER = "dev"
 USER_SUBJECT = "dev-local"
