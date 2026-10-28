@@ -23,10 +23,32 @@ import threading
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import psycopg
 
 from study import GradeDraft
+
+def unique_violation(constraint_name: str, table_name: str) -> psycopg.errors.UniqueViolation:
+    """A UniqueViolation whose .diag looks like one raised by a real server.
+
+    A hand-constructed psycopg error has no server result, so exc.diag.constraint_name
+    is None and Diagnostic is read-only. Code that checks the constraint name (as it
+    should) would never match. This subclass reports the same fields Postgres sends.
+    """
+
+    class _ServerUniqueViolation(psycopg.errors.UniqueViolation):
+        @property
+        def diag(self):
+            return SimpleNamespace(
+                sqlstate="23505",
+                constraint_name=constraint_name,
+                table_name=table_name,
+                message_primary=str(self),
+            )
+
+    return _ServerUniqueViolation(f'duplicate key value violates unique constraint "{constraint_name}"')
+
 
 LOCK_TIMEOUT_SECONDS = 5.0
 BARRIER_TIMEOUT_SECONDS = 0.5
@@ -188,9 +210,7 @@ class FakeCursor:
                         for a in self.db.attempts
                     )
                 if taken:
-                    raise psycopg.errors.UniqueViolation(
-                        'duplicate key value violates unique constraint "attempts_user_submission_key"'
-                    )
+                    raise unique_violation("attempts_user_submission_key", "attempts")
             self.conn.pending.append(
                 (
                     "attempt",
