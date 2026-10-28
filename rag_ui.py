@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -589,6 +590,13 @@ with tab_quiz:
             if not student_answer:
                 st.session_state.quiz_notice = "Write an answer before submitting."
             else:
+                # Reuse the submission_id when the same answer is resubmitted (retry,
+                # double-click, rerun) so the API records the attempt only once.
+                submission_key = (st.session_state.quiz_question_id, student_answer)
+                if st.session_state.get("quiz_submission_key") != submission_key:
+                    st.session_state.quiz_submission_key = submission_key
+                    st.session_state.quiz_submission_id = str(uuid.uuid4())
+
                 with st.spinner("Checking your answer…"):
                     grade_status, grade_data = api_request(
                         "POST",
@@ -596,6 +604,7 @@ with tab_quiz:
                         payload={
                             "question_id": st.session_state.quiz_question_id,
                             "answer": student_answer,
+                            "submission_id": st.session_state.quiz_submission_id,
                         },
                     )
 

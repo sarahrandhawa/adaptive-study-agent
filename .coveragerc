@@ -1,0 +1,13 @@
+[run]
+source = .
+omit =
+    tests/*
+    conftest.py
+    test_*.py
+    course/*
+    evals/*
+    .venv/*
+
+[report]
+show_missing = True
+skip_empty = True

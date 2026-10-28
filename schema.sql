@@ -104,8 +104,12 @@ create table attempts(
     identified_gap text,
     grader_model text,
     grader_version text,
+    submission_id uuid,
     created_at timestamptz default now()
 );
+
+-- Same name as migrations/001 so fresh and migrated databases match.
+create unique index attempts_user_submission_key on attempts (user_id, submission_id);
 
 create table question_state (
     user_id uuid references users(id) on delete restrict,
@@ -139,3 +143,17 @@ alter table question_sources enable row level security;
 alter table attempts enable row level security;
 alter table question_state enable row level security;
 alter table usage_daily enable row level security;
+
+CREATE UNIQUE INDEX IF NOT EXISTS courses_user_normalized_name_unique
+ON courses (
+    user_id,
+    LOWER(
+        REGEXP_REPLACE(
+            BTRIM(name),
+            '[[:space:]]+',
+            ' ',
+            'g'
+        )
+    )
+)
+WHERE archived_at IS NULL;

@@ -1,0 +1,4 @@
+# Test-only dependencies (not needed in production)
+-r requirements.txt
+pytest>=9.1
+pytest-cov==7.1.0

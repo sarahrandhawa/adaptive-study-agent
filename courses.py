@@ -1,5 +1,6 @@
 from db import get_conn
 
+from psycopg.errors import UniqueViolation
 
 def create_course(user_id, name):
     name = name.strip()
@@ -7,19 +8,25 @@ def create_course(user_id, name):
     if not name:
         raise ValueError("Course name must not be empty")
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO courses (user_id, name)
-                VALUES (%s, %s)
-                RETURNING id
-                """,
-                (user_id, name),
-            )
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO courses (user_id, name)
+                    VALUES (%s, %s)
+                    RETURNING id
+                    """,
+                    (user_id, name),
+                )
+                return cur.fetchone()[0]
 
-            return cur.fetchone()[0]
-
+    except UniqueViolation as exc:
+        if exc.diag.constraint_name == "courses_user_normalized_name_unique":
+            raise ValueError(
+                "You already have a course with this name"
+            ) from exc
+        raise
 
 def list_courses(user_id):
     with get_conn() as conn:

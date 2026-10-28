@@ -7,9 +7,11 @@ from pathlib import Path
 from urllib.parse import unquote
 from uuid import UUID
 
+import psycopg
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
-from openai import APIError, OpenAI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -137,12 +139,14 @@ class IngestResponse(BaseModel):
 
 class QuizRequest(BaseModel):
     course_id: UUID
-    topic: str = Field(min_length=1)
+    topic: str = Field(min_length=1, max_length=200)
 
 
 class GradeRequest(BaseModel):
     question_id: UUID
-    answer: str = Field(min_length=1)
+    answer: str = Field(min_length=1, max_length=10000)
+    # Client-generated per submission; a retry reuses it so the attempt is recorded once.
+    submission_id: UUID | None = None
 
 
 class CreateCourseRequest(BaseModel):
@@ -199,6 +203,17 @@ def call_model_structured(prompt: str, model: str) -> tuple[Answer, int, int, in
     prompt_tokens = usage.prompt_tokens if usage else 0
     completion_tokens = usage.completion_tokens if usage else 0
     return parsed, total, prompt_tokens, completion_tokens
+
+
+@app.exception_handler(psycopg.Error)
+def database_error(request: Request, exc: psycopg.Error) -> JSONResponse:
+    """Any unhandled database error: log it server-side, return a generic 503."""
+
+    logger.exception("Database error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The study database is temporarily unavailable. Please try again."},
+    )
 
 
 @app.get("/health")
@@ -302,6 +317,7 @@ def grade(body: GradeRequest, user_id=Depends(current_user)):
             user_id=user_id,
             question_id=body.question_id,
             student_answer=body.answer,
+            submission_id=body.submission_id,
         )
     except StudyValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -342,7 +358,7 @@ def ask(body: AskRequest, user_id=Depends(current_user)) -> AskResponse:
         )
         latency_ms = int((time.perf_counter() - start) * 1000)
         cost_usd = compute_cost_usd(model, prompt_tokens, completion_tokens)
-    except (ValidationError, ValueError, APIError) as exc:
+    except (ValidationError, ValueError, OpenAIError) as exc:
         raise service_error(exc, "The AI service had a problem answering. Please try again.") from exc
 
     return AskResponse(
