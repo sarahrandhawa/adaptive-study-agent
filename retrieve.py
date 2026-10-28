@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from db import get_conn
+from sources import live_chunk_ids
 from vectorstore import VectorStoreConfigError, get_embedding_model, get_vector_store
+
+# Pinecone can return vectors whose Postgres chunk is gone (delete not yet
+# propagated, failed purge, rolled-back ingest). Fetch extra candidates so that
+# dropping those still leaves k live chunks in the common case.
+OVERFETCH_FACTOR = 2
 
 
 class RetrieveValidationError(ValueError):
@@ -31,16 +38,29 @@ def retrieve_chunks(
 
         results = vector_store.similarity_search_with_score(
             normalized_query,
-            k=k,
+            k=k * OVERFETCH_FACTOR,
             filter={"course_id": str(course_id)},
         )
     except VectorStoreConfigError as exc:
         raise RuntimeError(str(exc)) from exc
 
+    candidate_ids = [(document.metadata or {}).get("chunk_id") for document, _ in results]
+
+    live_ids: set[str] = set()
+    if candidate_ids:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                live_ids = live_chunk_ids(cur, user_id=user_id, course_id=course_id, chunk_ids=candidate_ids)
+
     chunks: list[dict[str, Any]] = []
 
     for document, score in results:
         metadata = document.metadata or {}
+
+        if str(metadata.get("chunk_id")) not in live_ids:
+            continue
+        if len(chunks) == k:
+            break
 
         chunks.append(
             {

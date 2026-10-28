@@ -120,15 +120,24 @@ def test_delete_document_not_owned_touches_nothing(monkeypatch):
     assert deleted_vectors == []
 
 
-def test_delete_document_removes_vectors_then_soft_deletes(monkeypatch):
-    fake = use(monkeypatch, documents, ScriptedDB([(DOC_ID,)], [("c1",), ("c2",)], [], []))
+def test_delete_document_soft_deletes_first_then_purges_vectors(monkeypatch):
+    # lock doc (active, not purged), mark chunks, mark doc | purge: chunk ids, mark purged
+    fake = use(monkeypatch, documents, ScriptedDB([("active", None)], [], [], [("c1",), ("c2",)], []))
     deleted_vectors = []
-    monkeypatch.setattr(documents, "delete_vectors", lambda **kw: deleted_vectors.append(kw))
+
+    def record_delete(**kw):
+        # Postgres must already say "deleted" before Pinecone is touched.
+        assert any(sql.startswith("UPDATE documents SET status = 'deleted'") for sql, _ in fake.executed)
+        deleted_vectors.append(kw)
+
+    monkeypatch.setattr(documents, "delete_vectors", record_delete)
 
     assert documents.delete_document(USER_ID, DOC_ID) is True
+    assert "FOR UPDATE" in fake.sql(0)
+    assert fake.sql(1).startswith("UPDATE chunks SET deleted_at = now()")
+    assert fake.sql(2).startswith("UPDATE documents SET status = 'deleted'")
     assert deleted_vectors == [{"namespace": USER_ID, "ids": ["c1", "c2"]}]
-    assert fake.sql(2).startswith("UPDATE chunks SET deleted_at = now()")
-    assert fake.sql(3).startswith("UPDATE documents SET status = 'deleted'")
+    assert fake.sql(4).startswith("UPDATE documents SET vectors_deleted_at = now()")
     assert all(USER_ID in params for _, params in fake.executed)
 
 

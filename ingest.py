@@ -9,11 +9,11 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from db import get_conn
+from documents import try_purge_document_vectors
 from vectorstore import (
     VectorStoreConfigError,
     get_embedding_model,
     get_vector_store,
-    delete_vectors
 )
 
 
@@ -194,24 +194,6 @@ def ingest_document(*, user_id, course_id, filename: str, text: str) -> dict:
                     )
                 )
 
-            # If this upload replaces an older document,
-            # remember the old Pinecone vector IDs before changing anything.
-            old_chunk_ids = []
-
-            if old_document_id is not None:
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM chunks
-                    WHERE document_id = %s
-                    AND deleted_at IS NULL
-                    """,
-                    (old_document_id,),
-                )
-
-                old_chunk_ids = [str(row[0]) for row in cur.fetchall()]
-
-
             # Upload the NEW chunks to Pinecone.
             try:
                 vector_store = get_vector_store(namespace=str(user_id))
@@ -224,21 +206,19 @@ def ingest_document(*, user_id, course_id, filename: str, text: str) -> dict:
                 raise RuntimeError(str(exc)) from exc
 
 
-            # New version succeeded, so retire the OLD version.
+            # New version succeeded, so retire the OLD version in Postgres. Its
+            # vectors are purged after commit; until then retrieval ignores them
+            # because their chunks are no longer live (see sources.py).
             if old_document_id is not None:
-                delete_vectors(
-                    namespace=str(user_id),
-                    ids=old_chunk_ids,
-                )
-
                 cur.execute(
                     """
                     UPDATE documents
                     SET status = 'replaced',
                         deleted_at = now()
                     WHERE id = %s
+                      AND user_id = %s
                     """,
-                    (old_document_id,),
+                    (old_document_id, user_id),
                 )
 
                 cur.execute(
@@ -246,12 +226,17 @@ def ingest_document(*, user_id, course_id, filename: str, text: str) -> dict:
                     UPDATE chunks
                     SET deleted_at = now()
                     WHERE document_id = %s
+                      AND user_id = %s
+                      AND deleted_at IS NULL
                     """,
-                    (old_document_id,),
+                    (old_document_id, user_id),
                 )
 
-            return {
-                "document_id": document_id,
-                "chunks_indexed": len(chunk_ids),
-                "status": "indexed",
-            }
+    if old_document_id is not None:
+        try_purge_document_vectors(user_id, old_document_id)
+
+    return {
+        "document_id": document_id,
+        "chunks_indexed": len(chunk_ids),
+        "status": "indexed",
+    }

@@ -21,6 +21,8 @@ import httpx
 import streamlit as st
 from pypdf import PdfReader
 
+import ui_views
+
 TIMEOUT_SECONDS = 120.0
 
 
@@ -306,6 +308,10 @@ def render_past_questions(course_id: str) -> None:
             st.caption(" · ".join(details))
 
 
+def fetch(path: str, params: dict | None = None):
+    return api_request("GET", path, params=params)
+
+
 def reset_quiz_state() -> None:
     for key in ("quiz_question", "quiz_question_id", "quiz_grade", "quiz_notice"):
         st.session_state[key] = None
@@ -433,7 +439,9 @@ with st.sidebar:
                 st.session_state.pending_course_delete = None
                 st.rerun()
 
-tab_ingest, tab_ask, tab_quiz = st.tabs(["Study Materials", "Ask Your Materials", "Quiz Me"])
+tab_ingest, tab_ask, tab_quiz, tab_progress, tab_bank = st.tabs(
+    ["Study Materials", "Ask Your Materials", "Quiz Me", "Progress", "Question Bank"]
+)
 
 with tab_ingest:
     st.subheader("Add study materials")
@@ -632,3 +640,17 @@ with tab_quiz:
 
     st.divider()
     render_past_questions(selected_course_id)
+
+with tab_progress:
+    st.subheader("Your progress")
+    st.write("How well you know each topic, based on your graded answers.")
+    ui_views.render_course_progress(selected_course_id, fetch, error_message)
+
+    st.divider()
+    st.markdown("#### All courses")
+    ui_views.render_progress_overview(fetch, error_message)
+
+with tab_bank:
+    st.subheader("Question bank")
+    st.write("Review the questions you've practiced and their model answers.")
+    ui_views.render_question_bank(selected_course_id, fetch, error_message)

@@ -41,7 +41,8 @@ def vectors(monkeypatch):
         return store
 
     monkeypatch.setattr(ingest, "get_vector_store", get_store)
-    monkeypatch.setattr(ingest, "delete_vectors", lambda **kw: deleted.append(kw))
+    # Old-version vectors are purged after commit by documents.try_purge_document_vectors.
+    monkeypatch.setattr(ingest, "try_purge_document_vectors", lambda user_id, document_id: deleted.append((user_id, document_id)))
     return SimpleNamespace(store=store, namespaces=namespaces, deleted=deleted)
 
 
@@ -100,17 +101,24 @@ def test_ingest_new_file_indexes_chunks_in_user_namespace(monkeypatch, vectors):
     assert vectors.deleted == []
 
 
-def test_ingest_new_version_retires_old_vectors_after_upload(monkeypatch, vectors):
-    fake = ScriptedDB(
-        [(COURSE_ID,)], [], [(OLD_DOC_ID,)], [(DOC_ID,)], [("chunk-1",)],
-        [("old-1",), ("old-2",)], [], [],
-    )
+def test_ingest_new_version_retires_old_document_then_purges_after_commit(monkeypatch, vectors):
+    # course ok, no duplicate, older version, insert document, insert chunk, retire old doc + chunks
+    fake = ScriptedDB([(COURSE_ID,)], [], [(OLD_DOC_ID,)], [(DOC_ID,)], [("chunk-1",)], [], [])
     monkeypatch.setattr(ingest, "get_conn", fake.connect)
+    committed_before_purge = []
+    monkeypatch.setattr(
+        ingest,
+        "try_purge_document_vectors",
+        lambda user_id, document_id: committed_before_purge.append((fake.committed, user_id, document_id)),
+    )
 
     assert run_ingest(text="Updated notes.")["status"] == "indexed"
-    assert vectors.deleted == [{"namespace": USER_ID, "ids": ["old-1", "old-2"]}]
-    assert fake.sql(6).startswith("UPDATE documents SET status = 'replaced'")
-    assert fake.params(6) == (OLD_DOC_ID,)
+    assert fake.sql(5).startswith("UPDATE documents SET status = 'replaced'")
+    assert fake.params(5) == (OLD_DOC_ID, USER_ID)
+    assert fake.sql(6).startswith("UPDATE chunks SET deleted_at = now()")
+    assert fake.params(6) == (OLD_DOC_ID, USER_ID)
+    # Vectors of the old version are removed only after the new version is committed.
+    assert committed_before_purge == [(True, USER_ID, OLD_DOC_ID)]
 
 
 def test_ingest_vector_config_error_becomes_runtime_error_and_rolls_back(monkeypatch, vectors):
@@ -131,21 +139,30 @@ def test_retrieve_validates_input(query, k):
         retrieve.retrieve_chunks(query=query, user_id=USER_ID, course_id=COURSE_ID, k=k)
 
 
+CHUNK_1 = "c1c1c1c1-0000-0000-0000-000000000001"
+
+
 def test_retrieve_scopes_to_user_namespace_and_course(monkeypatch):
     doc = SimpleNamespace(
         page_content="text",
-        metadata={"chunk_id": "c1", "document_id": DOC_ID, "chunk_index": 2, "source": "notes.txt"},
+        metadata={"chunk_id": CHUNK_1, "document_id": DOC_ID, "chunk_index": 2, "source": "notes.txt"},
     )
     store = FakeVectorStore(results=[(doc, 0.87654321)])
     namespaces = []
     monkeypatch.setattr(retrieve, "get_vector_store", lambda namespace=None: namespaces.append(namespace) or store)
+    db = ScriptedDB([(CHUNK_1,)])
+    monkeypatch.setattr(retrieve, "get_conn", db.connect)
 
     result = retrieve.retrieve_chunks(query="  evaporation ", user_id=USER_ID, course_id=COURSE_ID, k=3)
 
     assert namespaces == [USER_ID]
-    assert store.queries == [{"query": "evaporation", "k": 3, "filter": {"course_id": COURSE_ID}}]
+    # Over-fetches (k * OVERFETCH_FACTOR) so stale vectors can be dropped without starving results.
+    assert store.queries == [
+        {"query": "evaporation", "k": 3 * retrieve.OVERFETCH_FACTOR, "filter": {"course_id": COURSE_ID}}
+    ]
+    assert db.params(0) == ([CHUNK_1], USER_ID, COURSE_ID)
     assert result["chunks"] == [
-        {"chunk_id": "c1", "score": 0.876543, "document_id": DOC_ID, "chunk_index": 2, "source": "notes.txt", "text": "text"}
+        {"chunk_id": CHUNK_1, "score": 0.876543, "document_id": DOC_ID, "chunk_index": 2, "source": "notes.txt", "text": "text"}
     ]
 
 

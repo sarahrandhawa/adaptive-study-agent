@@ -18,7 +18,8 @@ from memory_store import get_or_create_topic
 from rag import DEFAULT_RETRIEVAL_K, _format_chunk
 from retrieve import retrieve_chunks
 from db import get_conn
-from adaptive import priority_score, update_mastery
+from adaptive import CORRECT_THRESHOLD, PARTIAL_THRESHOLD, priority_score, update_mastery
+from sources import LIVE_CHUNK_CONDITIONS, QUESTION_HAS_LIVE_SOURCE
 
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -114,9 +115,9 @@ class GradeDraft(BaseModel):
     insufficient_reason: str = ""
 
 def verdict_from_score(score: float) -> str:
-    if score >= 0.85:
+    if score >= CORRECT_THRESHOLD:
         return "correct"
-    if score >= 0.35:
+    if score >= PARTIAL_THRESHOLD:
         return "partially_correct"
     return "incorrect"
 
@@ -397,8 +398,10 @@ def load_question_for_grading(*, user_id, question_id):
             if row is None:
                 raise StudyValidationError("Question not found")
 
+            # Only live source chunks: material from deleted/replaced documents or
+            # archived courses must never be used to grade.
             cur.execute(
-                """
+                f"""
                 SELECT
                     c.id,
                     c.document_id,
@@ -407,8 +410,16 @@ def load_question_for_grading(*, user_id, question_id):
                 FROM question_sources qs
                 JOIN chunks c
                     ON c.id = qs.chunk_id
+                   AND c.user_id = qs.user_id
+                JOIN documents d
+                    ON d.id = c.document_id
+                   AND d.user_id = c.user_id
+                JOIN courses co
+                    ON co.id = d.course_id
+                   AND co.user_id = d.user_id
                 WHERE qs.question_id = %s
                   AND qs.user_id = %s
+                  AND {LIVE_CHUNK_CONDITIONS}
                 ORDER BY qs.rank
                 """,
                 (question_id, user_id),
@@ -775,7 +786,7 @@ def get_question_candidates(*, user_id, topic_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     q.id,
                     q.prompt,
@@ -791,6 +802,7 @@ def get_question_candidates(*, user_id, topic_id):
                 WHERE q.user_id = %s
                   AND qt.topic_id = %s
                   AND q.status = 'active'
+                  AND {QUESTION_HAS_LIVE_SOURCE}
                 ORDER BY q.created_at
                 """,
                 (user_id, topic_id),
